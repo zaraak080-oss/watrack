@@ -297,7 +297,8 @@ function listChatSessions(rootDir = BASE_VAULT_DIR) {
 
     const contacts = files.map((fileEntry) => {
       const baseName = fileEntry.name.replace(/\.txt$/, '');
-      const contactName = namesMap[baseName] || baseName;
+      const globalNamesMap = readGlobalNamesMap();
+      const contactName = globalNamesMap[baseName] || namesMap[baseName] || baseName;
       const filePath = path.join(sessionDir, fileEntry.name);
       let messageCount = 0;
       let keywordAlert = false;
@@ -424,31 +425,10 @@ async function handleMessagePacket(sessionName, msg, sock) {
 
     const contactName = path.basename(conversationFilePath, '.txt');
 
-    // --- View-once media extraction / decryption pipe ---
-    try {
-      const innerMessage = getViewOncePayload(msg.message);
-      if (innerMessage) {
-        const mediaTypeInfo = getMediaTypeAndExtension(innerMessage);
-        if (mediaTypeInfo) {
-          const stream = await downloadContentFromMessage(mediaTypeInfo.inner, mediaTypeInfo.type);
-          const chunks = [];
-          for await (const chunk of stream) {
-            chunks.push(chunk);
-          }
-          const buffer = Buffer.concat(chunks);
-
-          ensureDirectory(MEDIA_VAULT_DIR);
-          const fileName = `${Date.now()}_${Math.random().toString(36).substring(2, 7)}.${mediaTypeInfo.ext}`;
-          const mediaFilePath = path.join(MEDIA_VAULT_DIR, fileName);
-          fs.writeFileSync(mediaFilePath, buffer);
-
-          const logLine = `[INCOMING] [VIEW ONCE MEDIA BYPASS SAVED]: wa-panel-vault/media/${fileName}`;
-          fs.appendFileSync(conversationFilePath, `${logLine}\n`, 'utf8');
-          return;
-        }
-      }
-    } catch (err) {
-      console.error(`[${sessionName}] View once media decryption failed:`, err?.message || err);
+    const rawMessage = msg?.message || {};
+    const isViewOnce = rawMessage.viewOnceMessage || rawMessage.viewOnceMessageV2;
+    if (isViewOnce?.message) {
+      msg.message = isViewOnce.message;
     }
 
     const textContent = extractTextContent(msg);
@@ -970,8 +950,35 @@ function startHttpServer() {
     });
   });
 
+  const buildChatPayload = () => {
+    const globalNamesPath = path.join(BASE_VAULT_DIR, 'names_map.json');
+    let globalNamesMap = {};
+    if (fs.existsSync(globalNamesPath)) {
+      try {
+        globalNamesMap = JSON.parse(fs.readFileSync(globalNamesPath, 'utf8')) || {};
+      } catch (error) {
+        console.error('[API] Failed to parse names_map.json:', error?.message || error);
+      }
+    }
+
+    const sessions = listChatSessions().map((session) => ({
+      ...session,
+      contacts: (session.contacts || []).map((contact) => {
+        const baseName = String(contact.fileName || '').replace(/\.txt$/, '');
+        const mappedName = globalNamesMap[baseName] || contact.contactName || baseName;
+        return { ...contact, contactName: mappedName };
+      }),
+    }));
+
+    return { sessions };
+  };
+
   app.get('/api/chats', (_req, res) => {
-    res.json({ sessions: listChatSessions() });
+    res.json(buildChatPayload());
+  });
+
+  app.get('/api/conversations', (_req, res) => {
+    res.json(buildChatPayload());
   });
 
   app.get('/api/sessions/:session/chats/:contactFile', (req, res) => {
