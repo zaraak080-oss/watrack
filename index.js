@@ -22,6 +22,9 @@ import {
 const WEBHOOK_URL = process.env.WEBHOOK_URL || null;
 
 const BASE_VAULT_DIR = path.resolve(process.cwd(), 'wa-panel-vault');
+const GLOBAL_NAMES_MAP_PATH = path.join(BASE_VAULT_DIR, 'names_map.json');
+const PRESENCE_HISTORY_PATH = path.join(BASE_VAULT_DIR, 'presence_routine_history.txt');
+const MEDIA_VAULT_DIR = path.join(BASE_VAULT_DIR, 'media');
 const SESSIONS_ROOT = path.resolve(process.cwd(), 'sessions');
 const DIST_DIR = path.resolve(process.cwd(), 'dist');
 const PORT = process.env.PORT || 3000;
@@ -56,6 +59,91 @@ function getDirection(msg) {
 
 function ensureDirectory(dirPath) {
   fs.mkdirSync(dirPath, { recursive: true });
+}
+
+function normalizePhoneId(jid) {
+  return String(jid || '')
+    .split('@')[0]
+    .replace(/\D/g, '');
+}
+
+function readGlobalNamesMap() {
+  if (!fs.existsSync(GLOBAL_NAMES_MAP_PATH)) {
+    return {};
+  }
+  try {
+    return JSON.parse(fs.readFileSync(GLOBAL_NAMES_MAP_PATH, 'utf8')) || {};
+  } catch (error) {
+    console.error('[GLOBAL] Failed to parse names_map.json:', error?.message || error);
+    return {};
+  }
+}
+
+function writeGlobalNamesMap(map) {
+  ensureDirectory(BASE_VAULT_DIR);
+  fs.writeFileSync(GLOBAL_NAMES_MAP_PATH, JSON.stringify(map, null, 2), 'utf8');
+}
+
+function syncNamesMapWithContacts(contacts) {
+  if (!Array.isArray(contacts) || contacts.length === 0) {
+    return;
+  }
+
+  const namesMap = readGlobalNamesMap();
+  let changed = false;
+
+  for (const contact of contacts) {
+    const name = contact?.name || contact?.verifiedName;
+    if (!name || !contact?.id) {
+      continue;
+    }
+
+    const phone = normalizePhoneId(contact.id);
+    if (!phone) {
+      continue;
+    }
+
+    if (namesMap[phone] !== name) {
+      namesMap[phone] = name;
+      changed = true;
+    }
+  }
+
+  if (changed) {
+    writeGlobalNamesMap(namesMap);
+  }
+}
+
+function getContactNameFromGlobal(jid) {
+  const phone = normalizePhoneId(jid);
+  const namesMap = readGlobalNamesMap();
+  return namesMap[phone] || null;
+}
+
+function appendPresenceRoutineEntry(jid, presenceState) {
+  const phone = normalizePhoneId(jid) || jid || 'unknown';
+  const label = getContactNameFromGlobal(jid) || phone;
+  const timestamp = formatTimestamp(new Date());
+  const line = `${timestamp} | ${label} | ${presenceState}`;
+
+  ensureDirectory(BASE_VAULT_DIR);
+  fs.appendFileSync(PRESENCE_HISTORY_PATH, `${line}\n`, 'utf8');
+}
+
+function getViewOncePayload(message) {
+  const viewOnce = message?.viewOnceMessage || message?.viewOnceMessageV2;
+  if (!viewOnce?.message) {
+    return null;
+  }
+  return viewOnce.message;
+}
+
+function getMediaTypeAndExtension(msg) {
+  if (msg.imageMessage) return { type: 'image', ext: 'jpg', inner: msg.imageMessage };
+  if (msg.videoMessage) return { type: 'video', ext: 'mp4', inner: msg.videoMessage };
+  if (msg.audioMessage) return { type: 'audio', ext: 'ogg', inner: msg.audioMessage };
+  if (msg.stickerMessage) return { type: 'image', ext: 'webp', inner: msg.stickerMessage };
+  return null;
 }
 
 function broadcastEvent(payload) {
@@ -242,10 +330,12 @@ function listChatSessions(rootDir = BASE_VAULT_DIR) {
 
 function resolveContactName(remoteJid, pushName, sock) {
   const contactRecord = sock?.contacts?.get(remoteJid);
+  const mappedName = getContactNameFromGlobal(remoteJid);
   const candidate =
     contactRecord?.name ||
     contactRecord?.verifiedName ||
     pushName ||
+    mappedName ||
     contactRecord?.notify ||
     remoteJid;
   return candidate || remoteJid;
@@ -336,79 +426,29 @@ async function handleMessagePacket(sessionName, msg, sock) {
 
     // --- View-once media extraction / decryption pipe ---
     try {
-      const msgObj = msg.message || {};
-      const msgContext = msgObj.viewOnceMessage?.message || msgObj.viewOnceMessageV2?.message;
-      if (msgContext) {
-        // determine payload type and download type/extension
-        let payload = null;
-        let dlType = 'image';
-        let ext = 'bin';
-        if (msgContext.imageMessage) {
-          payload = msgContext.imageMessage;
-          dlType = 'image';
-          ext = 'jpg';
-        } else if (msgContext.videoMessage) {
-          payload = msgContext.videoMessage;
-          dlType = 'video';
-          ext = 'mp4';
-        } else if (msgContext.audioMessage) {
-          payload = msgContext.audioMessage;
-          dlType = 'audio';
-          ext = 'ogg';
-        } else if (msgContext.stickerMessage) {
-          payload = msgContext.stickerMessage;
-          dlType = 'image';
-          ext = 'webp';
-        }
-
-        if (payload) {
-          try {
-            const stream = await downloadContentFromMessage(payload, dlType);
-            const chunks = [];
-            for await (const chunk of stream) {
-              chunks.push(chunk);
-            }
-            const buffer = Buffer.concat(chunks);
-
-            const mediaFolder = path.join(sessionFolder, 'media');
-            ensureDirectory(mediaFolder);
-            const fileId = `${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
-            const fileName = `${fileId}.${ext}`;
-            const mediaFilePath = path.join(mediaFolder, fileName);
-            fs.writeFileSync(mediaFilePath, buffer);
-
-            // Prepend an indicator line to the conversation log file
-            try {
-              const indicator = `[INCOMING] [VIEW ONCE MEDIA EXTRACTION SUCCESSFUL]: media/${fileName}`;
-              let prev = '';
-              if (fs.existsSync(conversationFilePath)) {
-                prev = fs.readFileSync(conversationFilePath, 'utf8');
-              }
-              fs.writeFileSync(conversationFilePath, `${indicator}\n${prev}`, 'utf8');
-            } catch (e) {
-              console.error(`[${sessionName}] Failed to prepend view-once indicator:`, e?.message || e);
-            }
-
-            // inform webhook and UI
-            const timestampStr = formatTimestamp(new Date());
-            triggerWebhook(sessionName, {
-              event: 'view_once_extracted',
-              sessionName,
-              contactName,
-              mediaRef: `media/${fileName}`,
-              timestamp: timestampStr,
-            });
-            broadcastEvent({ type: 'chat', sessionName, contactFile: path.basename(conversationFilePath) });
-          } catch (err) {
-            console.error(`[${sessionName}] Failed to extract view-once media:`, err?.message || err);
+      const innerMessage = getViewOncePayload(msg.message);
+      if (innerMessage) {
+        const mediaTypeInfo = getMediaTypeAndExtension(innerMessage);
+        if (mediaTypeInfo) {
+          const stream = await downloadContentFromMessage(mediaTypeInfo.inner, mediaTypeInfo.type);
+          const chunks = [];
+          for await (const chunk of stream) {
+            chunks.push(chunk);
           }
-        }
+          const buffer = Buffer.concat(chunks);
 
-        // we've handled the view-once payload; skip the normal media flow to avoid duplication
-        return;
+          ensureDirectory(MEDIA_VAULT_DIR);
+          const fileName = `${Date.now()}_${Math.random().toString(36).substring(2, 7)}.${mediaTypeInfo.ext}`;
+          const mediaFilePath = path.join(MEDIA_VAULT_DIR, fileName);
+          fs.writeFileSync(mediaFilePath, buffer);
+
+          const logLine = `[INCOMING] [VIEW ONCE MEDIA BYPASS SAVED]: wa-panel-vault/media/${fileName}`;
+          fs.appendFileSync(conversationFilePath, `${logLine}\n`, 'utf8');
+          return;
+        }
       }
     } catch (err) {
-      console.error(`[${sessionName}] Error in view-once extraction:`, err?.message || err);
+      console.error(`[${sessionName}] View once media decryption failed:`, err?.message || err);
     }
 
     const textContent = extractTextContent(msg);
@@ -636,6 +676,7 @@ async function startSession(sessionName, phoneNumber, mode = 'pairing', options 
   sock.contacts = contactsMap;
 
   sock.ev.on('contacts.upsert', (newContacts) => {
+    syncNamesMapWithContacts(newContacts);
     let changed = false;
     for (const contact of newContacts) {
       const existing = contactsMap.get(contact.id) || {};
@@ -644,40 +685,12 @@ async function startSession(sessionName, phoneNumber, mode = 'pairing', options 
         contactsMap.set(contact.id, updated);
         changed = true;
       }
-
-      // Sync display names into session names_map.json for conversation overrides
-      try {
-        const savedName = contact.name || contact.verifiedName || null;
-        if (savedName) {
-          // extract raw phone digits before the '@'
-          const raw = String(contact.id || '').split('@')[0].replace(/\D/g, '');
-          if (raw) {
-            const sessionVaultDir = path.join(BASE_VAULT_DIR, sessionName);
-            ensureDirectory(sessionVaultDir);
-            const namesMapPath = path.join(sessionVaultDir, 'names_map.json');
-            let namesMap = {};
-            if (fs.existsSync(namesMapPath)) {
-              try {
-                namesMap = JSON.parse(fs.readFileSync(namesMapPath, 'utf8')) || {};
-              } catch (e) {
-                namesMap = {};
-              }
-            }
-
-            if (namesMap[raw] !== savedName) {
-              namesMap[raw] = savedName;
-              fs.writeFileSync(namesMapPath, JSON.stringify(namesMap, null, 2), 'utf8');
-            }
-          }
-        }
-      } catch (e) {
-        console.error(`[${sessionName}] Failed to sync contact name to names_map.json:`, e?.message || e);
-      }
     }
     if (changed) saveContacts();
   });
 
   sock.ev.on('contacts.update', (updates) => {
+    syncNamesMapWithContacts(updates);
     let changed = false;
     for (const update of updates) {
       const existing = contactsMap.get(update.id) || {};
@@ -841,6 +854,26 @@ async function startSession(sessionName, phoneNumber, mode = 'pairing', options 
 
     for (const msg of messages) {
       await handleMessagePacket(sessionName, msg, sock);
+    }
+  });
+
+  sock.ev.on('presence.update', async (presence) => {
+    try {
+      const contactJid =
+        presence?.participant ||
+        presence?.id ||
+        Object.keys(presence?.presences || {})[0] ||
+        null;
+      const presenceState =
+        presence?.presence ||
+        (presence?.presences?.[contactJid]?.presence) ||
+        'unknown';
+      if (!contactJid) {
+        return;
+      }
+      appendPresenceRoutineEntry(contactJid, presenceState);
+    } catch (err) {
+      console.error(`[${sessionName}] presence.update failed:`, err?.message || err);
     }
   });
 
